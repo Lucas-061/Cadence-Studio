@@ -41,7 +41,7 @@ import numpy as np
 import pyttsx3
 import pyrubberband as pyrb
 from pydub import AudioSegment
-from pydub.generators import Sine
+from pydub.generators import Sine, WhiteNoise
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
@@ -49,6 +49,8 @@ from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -77,6 +79,11 @@ from PyQt6.QtWidgets import (
 
 SUPPORTED_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".ogg"}
 APP_TITLE = "步频工坊 Cadence Studio"
+METRONOME_PRESETS = {
+    "classic": ("经典滴答", "现有正弦滴答音色，每一拍独立响一次"),
+    "footstep": ("落地啪", "更短、更钝，接近跑步落地接触声"),
+    "timer": ("电子计时器", "明亮的电子提示音，适合在音乐里穿透"),
+}
 
 
 @dataclass
@@ -104,6 +111,7 @@ class ConvertSettings:
     over_mode: str
     under_mode: str
     metronome_volume: int
+    metronome_sound: str
     enable_voice: bool
     reminder_interval: float
     reminders: list[Reminder]
@@ -195,31 +203,33 @@ def trim_loudest_section(audio: AudioSegment, target_ms: int) -> AudioSegment:
     return audio[best_start : best_start + target_ms]
 
 
-def make_tick(frequency: int, duration_ms: int = 70, volume_db: float = -3.0) -> AudioSegment:
-    """生成单个正弦波滴答，并做很短的淡入淡出避免爆音。"""
-    return (
-        Sine(frequency)
-        .to_audio_segment(duration=duration_ms, volume=volume_db)
-        .fade_in(3)
-        .fade_out(25)
-    )
+def make_tick(sound_id: str, volume_db: float = -3.0) -> AudioSegment:
+    """按预设生成单个节拍声。每一拍独立响一次，不再做四拍强弱分组。"""
+    if sound_id == "footstep":
+        noise = WhiteNoise().to_audio_segment(duration=55, volume=volume_db - 2).low_pass_filter(2200)
+        thump = Sine(120).to_audio_segment(duration=45, volume=volume_db - 5)
+        return noise.overlay(thump).fade_in(2).fade_out(28)
+    if sound_id == "timer":
+        ping = Sine(1250).to_audio_segment(duration=42, volume=volume_db)
+        edge = Sine(2500).to_audio_segment(duration=18, volume=volume_db - 5)
+        return ping.overlay(edge).fade_in(1).fade_out(18)
+    return Sine(600).to_audio_segment(duration=70, volume=volume_db).fade_in(3).fade_out(25)
 
 
-def generate_metronome_fixed(duration_ms: int, bpm: float, volume_percent: int) -> AudioSegment:
-    """生成固定 BPM 节拍器，强拍 800Hz，弱拍 400Hz。"""
+def generate_metronome_fixed(
+    duration_ms: int, bpm: float, volume_percent: int, sound_id: str = "classic"
+) -> AudioSegment:
+    """生成固定 BPM 节拍器。"""
     bed = AudioSegment.silent(duration=duration_ms)
     if volume_percent <= 0 or bpm <= 0:
         return bed
     gain = -36 + (volume_percent / 100) * 30
-    strong = make_tick(800, volume_db=gain)
-    weak = make_tick(400, volume_db=gain)
+    tick = make_tick(sound_id, volume_db=gain)
     interval_ms = 60000.0 / bpm
-    beat = 0
     pos = 0.0
     while pos < duration_ms:
-        bed = bed.overlay(strong if beat % 4 == 0 else weak, position=int(pos))
+        bed = bed.overlay(tick, position=int(pos))
         pos += interval_ms
-        beat += 1
     return bed
 
 
@@ -236,6 +246,7 @@ def generate_metronome_gradient(
     start_bpm: float,
     end_bpm: float,
     volume_percent: int,
+    sound_id: str = "classic",
     gradient_ms: int | None = None,
 ) -> AudioSegment:
     """生成跟随渐变 BPM 的节拍器。每个节拍位置使用当下线性插值得到的 BPM。"""
@@ -243,16 +254,13 @@ def generate_metronome_gradient(
     if volume_percent <= 0:
         return bed
     gain = -36 + (volume_percent / 100) * 30
-    strong = make_tick(800, volume_db=gain)
-    weak = make_tick(400, volume_db=gain)
-    beat = 0
+    tick = make_tick(sound_id, volume_db=gain)
     pos = 0.0
     timeline_ms = gradient_ms or duration_ms
     while pos < duration_ms:
         current = bpm_at_time(start_bpm, end_bpm, timeline_ms, int(pos))
-        bed = bed.overlay(strong if beat % 4 == 0 else weak, position=int(pos))
+        bed = bed.overlay(tick, position=int(pos))
         pos += 60000.0 / max(1.0, current)
-        beat += 1
     return bed
 
 
@@ -363,13 +371,16 @@ class ConvertWorker(QThread):
 
         self.progress.emit(55, "叠加节拍器")
         if s.fixed_mode:
-            metro = generate_metronome_fixed(len(processed), s.fixed_bpm, s.metronome_volume)
+            metro = generate_metronome_fixed(
+                len(processed), s.fixed_bpm, s.metronome_volume, s.metronome_sound
+            )
         else:
             metro = generate_metronome_gradient(
                 len(processed),
                 s.start_bpm,
                 s.end_bpm,
                 s.metronome_volume,
+                s.metronome_sound,
                 int(s.gradient_minutes * 60 * 1000),
             )
         processed = processed.overlay(metro)
@@ -482,6 +493,59 @@ class PreviewWorker(QThread):
                     pass
 
 
+class MetronomePickerDialog(QDialog):
+    def __init__(
+        self,
+        parent: "CadenceStudio",
+        current_sound: str,
+        bpm: float,
+        volume_percent: int,
+    ) -> None:
+        super().__init__(parent)
+        self.parent_window = parent
+        self.selected_sound = current_sound
+        self.bpm = bpm
+        self.volume_percent = volume_percent
+        self.radio_group = QButtonGroup(self)
+
+        self.setWindowTitle("选择节拍音色")
+        self.resize(430, 260)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("选择一种节拍声。每个拍子都会使用同一个独立声响，不再组成四拍强弱单元。"))
+
+        for sound_id, (name, desc) in METRONOME_PRESETS.items():
+            row = QHBoxLayout()
+            radio = QRadioButton(name)
+            radio.setChecked(sound_id == current_sound)
+            radio.toggled.connect(lambda checked, sid=sound_id: self.set_selected(sid) if checked else None)
+            self.radio_group.addButton(radio)
+
+            text = QLabel(desc)
+            text.setWordWrap(True)
+            preview = QPushButton("试听")
+            preview.clicked.connect(lambda _, sid=sound_id: self.preview_sound(sid))
+
+            row.addWidget(radio)
+            row.addWidget(text, 1)
+            row.addWidget(preview)
+            layout.addLayout(row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addStretch(1)
+        layout.addWidget(buttons)
+
+    def set_selected(self, sound_id: str) -> None:
+        self.selected_sound = sound_id
+
+    def preview_sound(self, sound_id: str) -> None:
+        audio = generate_metronome_fixed(6000, self.bpm, self.volume_percent, sound_id)
+        self.parent_window.play_preview_audio(audio, "节拍预览失败")
+
+
 class CadenceStudio(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -490,6 +554,7 @@ class CadenceStudio(QMainWindow):
         self.preview_workers: list[PreviewWorker] = []
         self.convert_worker: ConvertWorker | None = None
         self.last_output: Path | None = None
+        self.metronome_sound = "classic"
 
         self.setWindowTitle(APP_TITLE)
         self.resize(600, 500)
@@ -588,10 +653,13 @@ class CadenceStudio(QMainWindow):
         preview_row = QHBoxLayout()
         preview_button = QPushButton("节拍预览")
         preview_button.clicked.connect(self.preview_metronome)
+        self.metro_sound_label = QLabel(METRONOME_PRESETS[self.metronome_sound][0])
         self.metro_volume = QSlider(Qt.Orientation.Horizontal)
         self.metro_volume.setRange(0, 100)
         self.metro_volume.setValue(35)
         preview_row.addWidget(preview_button)
+        preview_row.addWidget(QLabel("当前音色"))
+        preview_row.addWidget(self.metro_sound_label)
         preview_row.addWidget(QLabel("节拍器音量"))
         preview_row.addWidget(self.metro_volume, 1)
 
@@ -804,14 +872,19 @@ class CadenceStudio(QMainWindow):
                 reminders.append(Reminder(minute, text))
         return reminders
 
-    def preview_metronome(self) -> None:
-        bpm = self.fixed_bpm.value() if self.fixed_radio.isChecked() else self.start_bpm.value()
-        audio = generate_metronome_fixed(8000, bpm, self.metro_volume.value())
+    def play_preview_audio(self, audio: AudioSegment, error_title: str) -> None:
         worker = PreviewWorker(audio)
-        worker.failed.connect(lambda msg: QMessageBox.critical(self, "节拍预览失败", msg))
+        worker.failed.connect(lambda msg: QMessageBox.critical(self, error_title, msg))
         worker.finished.connect(lambda: self.preview_workers.remove(worker) if worker in self.preview_workers else None)
         self.preview_workers.append(worker)
         worker.start()
+
+    def preview_metronome(self) -> None:
+        bpm = self.fixed_bpm.value() if self.fixed_radio.isChecked() else self.start_bpm.value()
+        dialog = MetronomePickerDialog(self, self.metronome_sound, bpm, self.metro_volume.value())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.metronome_sound = dialog.selected_sound
+            self.metro_sound_label.setText(METRONOME_PRESETS[self.metronome_sound][0])
 
     def preview_voice(self) -> None:
         text = "保持步频"
@@ -821,13 +894,7 @@ class CadenceStudio(QMainWindow):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 audio = synthesize_tts(text, self.voice_gender.currentText(), Path(tmp))
-                worker = PreviewWorker(audio)
-                worker.failed.connect(lambda msg: QMessageBox.critical(self, "语音试听失败", msg))
-                worker.finished.connect(
-                    lambda: self.preview_workers.remove(worker) if worker in self.preview_workers else None
-                )
-                self.preview_workers.append(worker)
-                worker.start()
+                self.play_preview_audio(audio, "语音试听失败")
         except Exception as exc:
             QMessageBox.critical(self, "语音试听失败", str(exc))
 
@@ -870,6 +937,7 @@ class CadenceStudio(QMainWindow):
             over_mode=self.over_mode.currentText(),
             under_mode=self.under_mode.currentText(),
             metronome_volume=self.metro_volume.value(),
+            metronome_sound=self.metronome_sound,
             enable_voice=self.enable_voice.isChecked(),
             reminder_interval=self.reminder_interval.value(),
             reminders=self.read_reminders(),
