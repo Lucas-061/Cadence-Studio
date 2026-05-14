@@ -16,6 +16,7 @@ pyrubberband 还依赖 Rubber Band 命令行工具：
 
 PyInstaller 打包示例：
     pyinstaller --noconfirm --windowed --name "Cadence Studio" ^
+      --add-data "assets/metronome_beat_170bpm.wav;assets" ^
       --hidden-import=librosa --hidden-import=librosa.core --hidden-import=soundfile ^
       --hidden-import=pyrubberband --hidden-import=pyttsx3.drivers ^
       --hidden-import=pyttsx3.drivers.sapi5 --hidden-import=pydub ^
@@ -81,9 +82,15 @@ SUPPORTED_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".ogg"}
 APP_TITLE = "步频工坊 Cadence Studio"
 METRONOME_PRESETS = {
     "classic": ("经典滴答", "现有正弦滴答音色，每一拍独立响一次"),
-    "footstep": ("落地啪", "更短、更钝，接近跑步落地接触声"),
+    "footstep": ("强风吹拂节拍", "从 170bpm 强风吹拂素材中提取的节拍切片"),
     "timer": ("电子计时器", "明亮的电子提示音，适合在音乐里穿透"),
 }
+
+
+def app_resource_path(relative_path: str) -> Path:
+    """获取开发环境或 PyInstaller 打包环境中的资源路径。"""
+    base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base_dir / relative_path
 
 
 @dataclass
@@ -206,6 +213,15 @@ def trim_loudest_section(audio: AudioSegment, target_ms: int) -> AudioSegment:
 def make_tick(sound_id: str, volume_db: float = -3.0) -> AudioSegment:
     """按预设生成单个节拍声。每一拍独立响一次，不再做四拍强弱分组。"""
     if sound_id == "footstep":
+        asset_path = app_resource_path("assets/metronome_beat_170bpm.wav")
+        if asset_path.exists():
+            return (
+                AudioSegment.from_file(asset_path)
+                .set_channels(1)
+                .apply_gain(volume_db)
+                .fade_in(2)
+                .fade_out(45)
+            )
         noise = WhiteNoise().to_audio_segment(duration=55, volume=volume_db - 2).low_pass_filter(2200)
         thump = Sine(120).to_audio_segment(duration=45, volume=volume_db - 5)
         return noise.overlay(thump).fade_in(2).fade_out(28)
