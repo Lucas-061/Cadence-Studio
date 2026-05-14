@@ -43,8 +43,9 @@ import pyttsx3
 import pyrubberband as pyrb
 from pydub import AudioSegment
 from pydub.generators import Sine, WhiteNoise
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QThread, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction
+from PyQt6.QtMultimedia import QSoundEffect
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -476,39 +477,6 @@ class ConvertWorker(QThread):
         return audio
 
 
-class PreviewWorker(QThread):
-    failed = pyqtSignal(str)
-
-    def __init__(self, audio: AudioSegment) -> None:
-        super().__init__()
-        self.audio = audio
-
-    def run(self) -> None:
-        temp_path = None
-        try:
-            # 避免 pydub.playback 在 PyQt 中调用 ffplay/simpleaudio 导致进程闪退；
-            # Windows 下直接交给 winsound 播放临时 WAV 更稳定。
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                temp_path = tmp.name
-            self.audio.export(temp_path, format="wav")
-            if sys.platform.startswith("win"):
-                import winsound
-
-                winsound.PlaySound(temp_path, winsound.SND_FILENAME)
-            else:
-                from pydub.playback import play
-
-                play(AudioSegment.from_file(temp_path))
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        finally:
-            if temp_path:
-                try:
-                    Path(temp_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-
 class MetronomePickerDialog(QDialog):
     def __init__(
         self,
@@ -561,16 +529,21 @@ class MetronomePickerDialog(QDialog):
         audio = generate_metronome_fixed(6000, self.bpm, self.volume_percent, sound_id)
         self.parent_window.play_preview_audio(audio, "节拍预览失败")
 
+    def done(self, result: int) -> None:
+        self.parent_window.stop_preview_audio()
+        super().done(result)
+
 
 class CadenceStudio(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.files: dict[str, AudioFile] = {}
         self.detect_workers: list[BPMDetectWorker] = []
-        self.preview_workers: list[PreviewWorker] = []
         self.convert_worker: ConvertWorker | None = None
         self.last_output: Path | None = None
         self.metronome_sound = "classic"
+        self.preview_effect: QSoundEffect | None = None
+        self.preview_temp_path: Path | None = None
 
         self.setWindowTitle(APP_TITLE)
         self.resize(600, 500)
@@ -889,11 +862,33 @@ class CadenceStudio(QMainWindow):
         return reminders
 
     def play_preview_audio(self, audio: AudioSegment, error_title: str) -> None:
-        worker = PreviewWorker(audio)
-        worker.failed.connect(lambda msg: QMessageBox.critical(self, error_title, msg))
-        worker.finished.connect(lambda: self.preview_workers.remove(worker) if worker in self.preview_workers else None)
-        self.preview_workers.append(worker)
-        worker.start()
+        try:
+            self.stop_preview_audio()
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                temp_path = Path(tmp.name)
+            audio.export(temp_path, format="wav")
+
+            effect = QSoundEffect(self)
+            effect.setSource(QUrl.fromLocalFile(str(temp_path)))
+            effect.setLoopCount(1)
+            effect.setVolume(1.0)
+            effect.play()
+            self.preview_effect = effect
+            self.preview_temp_path = temp_path
+        except Exception as exc:
+            QMessageBox.critical(self, error_title, str(exc))
+
+    def stop_preview_audio(self) -> None:
+        if self.preview_effect is not None:
+            self.preview_effect.stop()
+            self.preview_effect.deleteLater()
+            self.preview_effect = None
+        if self.preview_temp_path is not None:
+            try:
+                self.preview_temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self.preview_temp_path = None
 
     def preview_metronome(self) -> None:
         bpm = self.fixed_bpm.value() if self.fixed_radio.isChecked() else self.start_bpm.value()
@@ -1030,6 +1025,10 @@ class CadenceStudio(QMainWindow):
             "步频工坊 Cadence Studio\n\n"
             "用于跑步训练音乐的 BPM 调整、节拍器叠加与离线语音提醒生成。",
         )
+
+    def closeEvent(self, event) -> None:
+        self.stop_preview_audio()
+        super().closeEvent(event)
 
 
 def main() -> int:
