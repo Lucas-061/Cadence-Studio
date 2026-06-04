@@ -80,6 +80,13 @@ from PyQt6.QtWidgets import (
 
 
 SUPPORTED_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".ogg"}
+OUTPUT_FORMATS = {
+    "MP3": {"extension": "mp3", "format": "mp3", "bitrate": True},
+    "WAV": {"extension": "wav", "format": "wav", "bitrate": False},
+    "FLAC": {"extension": "flac", "format": "flac", "bitrate": False},
+    "M4A": {"extension": "m4a", "format": "ipod", "bitrate": True, "codec": "aac"},
+    "OGG": {"extension": "ogg", "format": "ogg", "bitrate": True, "codec": "libvorbis"},
+}
 APP_TITLE = "步频工坊 Cadence Studio"
 METRONOME_PRESETS = {
     "classic": ("经典滴答", "现有正弦滴答音色，每一拍独立响一次"),
@@ -124,6 +131,7 @@ class ConvertSettings:
     reminder_interval: float
     reminders: list[Reminder]
     voice_gender: str
+    output_format: str
     bitrate: str
     output_dir: Path
 
@@ -407,10 +415,17 @@ class ConvertWorker(QThread):
             processed = self.overlay_reminders(processed)
 
         self.progress.emit(90, "导出中")
-        name = f"{s.source_path.stem}_{target_label}bpm_{int(s.target_minutes)}min.mp3"
+        format_info = OUTPUT_FORMATS[s.output_format]
+        extension = format_info["extension"]
+        name = f"{s.source_path.stem}_{target_label}bpm_{int(s.target_minutes)}min.{extension}"
         safe_name = "".join(c for c in name if c not in r'\/:*?"<>|')
         out_path = s.output_dir / safe_name
-        processed.export(out_path, format="mp3", bitrate=s.bitrate)
+        export_kwargs = {"format": format_info["format"]}
+        if format_info.get("bitrate"):
+            export_kwargs["bitrate"] = s.bitrate
+        if "codec" in format_info:
+            export_kwargs["codec"] = format_info["codec"]
+        processed.export(out_path, **export_kwargs)
         self.progress.emit(100, "转换完成")
         return out_path
 
@@ -718,8 +733,9 @@ class CadenceStudio(QMainWindow):
     def make_export_tab(self) -> QWidget:
         tab = QWidget()
         form = QFormLayout(tab)
-        self.output_format = QLineEdit("MP3")
-        self.output_format.setReadOnly(True)
+        self.output_format = QComboBox()
+        self.output_format.addItems(OUTPUT_FORMATS.keys())
+        self.output_format.currentTextChanged.connect(self.update_output_format_ui)
         self.bitrate = QComboBox()
         self.bitrate.addItems(["192k", "320k"])
         self.output_dir = QLineEdit(str(Path.cwd()))
@@ -731,11 +747,12 @@ class CadenceStudio(QMainWindow):
         row.addWidget(self.output_dir, 1)
         row.addWidget(browse_button)
         row_widget.setLayout(row)
-        self.template_label = QLabel("{原曲名}_{步频}bpm_{时长}min.mp3")
+        self.template_label = QLabel()
         form.addRow("输出格式", self.output_format)
         form.addRow("比特率", self.bitrate)
         form.addRow("输出目录", row_widget)
         form.addRow("文件名模板", self.template_label)
+        self.update_output_format_ui()
         return tab
 
     def check_ffmpeg_on_start(self) -> None:
@@ -914,6 +931,13 @@ class CadenceStudio(QMainWindow):
         if directory:
             self.output_dir.setText(directory)
 
+    def update_output_format_ui(self) -> None:
+        output_format = self.output_format.currentText() if hasattr(self, "output_format") else "MP3"
+        format_info = OUTPUT_FORMATS.get(output_format, OUTPUT_FORMATS["MP3"])
+        extension = format_info["extension"]
+        self.template_label.setText(f"{{原曲名}}_{{步频}}bpm_{{时长}}min.{extension}")
+        self.bitrate.setEnabled(bool(format_info.get("bitrate")))
+
     def collect_settings(self) -> ConvertSettings | None:
         audio = self.current_audio()
         if not audio:
@@ -953,6 +977,7 @@ class CadenceStudio(QMainWindow):
             reminder_interval=self.reminder_interval.value(),
             reminders=self.read_reminders(),
             voice_gender=self.voice_gender.currentText(),
+            output_format=self.output_format.currentText(),
             bitrate=self.bitrate.currentText(),
             output_dir=output_dir,
         )
